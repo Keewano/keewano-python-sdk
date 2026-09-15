@@ -1,0 +1,31 @@
+# Development and CI requirements. The SDK itself has ZERO runtime dependencies --
+# see `dependencies = []` in pyproject.toml -- and that is a shipped guarantee, not an
+# accident. Nothing in this file is installed into an integrator's application.
+#
+# This file also has to exist. builder-python's before_script runs
+# `REQ_FILES=($(ls requirements*.txt))` unconditionally, before it looks at
+# INSTALL_DEPS_COMMAND, so a repo with no requirements file at all fails the job on the
+# `ls` rather than on anything to do with its dependencies.
+
+# The SDK itself, editable. Puts `keewano_sdk` on sys.path for pytest and for pysonar
+# (which analyses what is installed in its interpreter), so no test or CI command needs
+# a PYTHONPATH prefix -- and builder-python's custom-command runner cannot carry one
+# anyway: it word-splits an expanded string, where a leading VAR=value is parsed as the
+# command name, not as an assignment.
+-e .
+
+# Pinned, unlike the linters the builder image already ships. black's output changes
+# between releases, so an unpinned formatter turns `black --check` into a gate that goes
+# red on a commit that touched nothing -- the whole repo was formatted with this exact
+# version. Bump deliberately, re-run `black .`, and commit the reformat with the bump.
+black==26.5.1
+
+# Pinned for the same reason: a new pycodestyle release can add a check and fail a build
+# that changed no code.
+flake8==7.3.0
+
+# Test run + coverage.xml for Sonar. pytest runs the suite's unittest.TestCase classes
+# as-is, so `python -m unittest discover -s tests` stays the documented local command
+# and CI just adds the coverage reporting around the same tests.
+pytest==9.1.1
+pytest-cov==7.1.0

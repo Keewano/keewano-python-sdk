@@ -1,0 +1,94 @@
+"""Predefined event IDs.
+
+These are **permanent** and must be identical across all SDKs as well as the backend
+(``predefined_events.h``). Once assigned, a number never changes.
+"""
+
+
+class KEvents:
+    # First id in the custom-event range; ids below this are reserved for predefined events.
+    CUSTOM_EVENT_ID_MIN = 2500
+
+    APP_LAUNCH = 2
+    SESSION_START = 3
+    SESSION_END = 4
+    GENUINITY_CHECK = 5
+    DEVICE_TYPE = 6
+    GPU_TYPE = 7
+    OS = 8
+    RAM_SIZE = 9
+    VRAM_SIZE = 10
+    SCREEN_RESOLUTION = 11
+    SYSTEM_LANG = 12
+    ERROR_MSG = 13
+    LOW_MEM_WARNING = 14
+    INSTALL_CAMPAIGN = 15
+    SCENE_LOADED = 16
+    SCENE_UNLOADED = 17
+    DEEP_LINK_ACTIVATED = 18
+    INTERNET_DISCONNECTED = 19
+    BUTTON_CLICK = 20
+    EMPTY_SPACE_CLICK = 21
+    WINDOW_OPEN = 22
+    WINDOW_CLOSE = 23
+    ITEMS_EXCHANGE = 24
+    DAY_IN_GAME_STARTED = 25
+    COUNTRY = 26
+
+    APP_PAUSE = 28
+    APP_RESUME = 29
+    INTERNET_CONNECTED = 30
+
+    PURCHASE_PRODUCT_ID = 32
+    PURCHASE_PRODUCT_PRICE_USD_CENTS = 33
+    PLATFORM = 34
+
+    PURCHASE_TIMESTAMP = 35
+    AB_TEST_ASSIGNMENT = 36
+
+    ITEMS_RESET = 37
+    USER_ID_ASSIGNED = 38
+
+    POINTER1_DOWN = 39
+    POINTER1_UP = 40
+
+    BATCH_DROPPED = 42
+
+    GAME_LANG = 43
+    ONBOARDING_MILESTONE = 50
+    ITEMS_PURCHASED_GRANT = 54
+
+    AD_REVENUE_TIMESTAMP = 57
+    AD_REVENUE_PLACEMENT = 58
+    AD_REVENUE_USD_CENTS = 59
+
+    ITEMS_AD_GRANTED = 60
+
+    SUBSCRIPTION_REVENUE_TIMESTAMP = 64
+    SUBSCRIPTION_REVENUE_PACKAGE = 65
+    SUBSCRIPTION_REVENUE_USD_CENTS = 66
+
+    ITEMS_SUBSCRIPTION_GRANTED = 67
+
+    PURCHASE_LOCAL_CURRENCY_NAME = 71
+    PURCHASE_LOCAL_CURRENCY_AMOUNT = 72
+    AD_REVENUE_LOCAL_CURRENCY_NAME = 73
+    AD_REVENUE_LOCAL_CURRENCY_AMOUNT = 74
+    SUBSCRIPTION_LOCAL_CURRENCY_NAME = 75
+    SUBSCRIPTION_LOCAL_CURRENCY_AMOUNT = 76
+
+    PRE_SDK_REGISTRATION_DATE = 77
+
+    AD_OFFERED_PLACEMENT = 78
+    AD_OFFERED_TYPE = 79
+
+
+class KBatchDropReason:
+    """Mirror of the Android SDK's ``KBatchDropReason``."""
+
+    BROKEN_CUSTOM_EVENT_MAPPING = 1
+    TOO_MANY_UNSENT_EVENTS = 2
+    # Reserved for the send-failure drop path (a head batch refused past the retry budget). Not yet
+    # emitted: until the backend recognizes this value, that path reports TOO_MANY_UNSENT_EVENTS.
+    # Reserved here anyway because, once assigned, a drop-reason number never changes.
+    SEND_FAILED = 3

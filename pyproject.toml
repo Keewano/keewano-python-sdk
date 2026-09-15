@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "keewano-sdk"
+version = "1.0.0"
+description = "Keewano analytics SDK for native Python applications"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { file = "LICENSE.md" }
+authors = [{ name = "Keewano" }]
+keywords = ["analytics", "keewano", "sdk", "telemetry", "game-analytics"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Libraries",
+]
+# Zero runtime dependencies: the SDK uses only the Python standard library.
+dependencies = []
+
+[project.urls]
+Homepage = "https://www.keewano.com"
+Source = "https://github.com/Keewano/keewano-python-sdk"
+Documentation = "https://github.com/Keewano/keewano-python-sdk#readme"
+Issues = "https://github.com/Keewano/keewano-python-sdk/issues"
+
+[tool.setuptools.packages.find]
+include = ["keewano_sdk*"]
+
+[tool.setuptools.package-data]
+keewano_sdk = ["py.typed"]
+
+[tool.black]
+# 120, not black's default 88: the SDK's comments carry the *reasoning* behind each
+# decision (see any module docstring), and 88 columns turns those into ragged
+# three-line paragraphs. Chosen to fit the code that was already here.
+line-length = 120
+# Must track `requires-python` above. Black emits formatting that is only valid on
+# newer interpreters (parenthesized context managers, for one) unless it is told the
+# floor, and CI runs a much newer Python than the 3.8 this package promises to support.
+target-version = ["py38"]
+# The codegen output asks to be skipped, in its own header: "Formatters and linters should
+# skip it (black, ruff, flake8)". It happens to be black-clean today, so this is not
+# fixing a failure -- it stops a future codegen release whose output black disagrees with
+# from turning `python:format` red in an MR that never touched the generated file.
+# force-exclude, not exclude, so it holds even when the path is passed explicitly.
+force-exclude = "sample/keewano_custom_events\\.py"
