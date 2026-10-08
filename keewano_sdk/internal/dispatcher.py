@@ -28,7 +28,7 @@ import time
 from typing import Dict, List, Optional, Sequence
 
 from ..item import Item
-from . import guid, serializer
+from . import encoding, guid, serializer
 from .batch import CutPoint, KBatch
 from .buffer import KBuffer
 from .consent import UserConsentState
@@ -63,12 +63,9 @@ FLUSH_INTERVAL_MS = 180_000
 #: otherwise block the queue behind it indefinitely. In-memory, so a restart gives a fresh budget.
 MAX_BATCH_ATTEMPTS = 10
 
-#: Hard cap on items in one event, so no single event can exceed the slicing threshold.
-MAX_ITEMS_PER_EVENT = 512
-
-#: Hard cap on any string payload, for the same reason (one event larger than the cutting threshold
-#: cannot be split — cut points only fall between events).
-MAX_EVENT_STRING_CHARS = 8 * 1024
+# Re-exported: the caps live with the encoders but are part of this module's long-standing surface.
+MAX_ITEMS_PER_EVENT = encoding.MAX_ITEMS_PER_EVENT
+MAX_EVENT_STRING_CHARS = encoding.MAX_EVENT_STRING_CHARS
 
 
 class _AutoResetEvent:
@@ -114,7 +111,7 @@ class KEventDispatcher:
     ) -> None:
         # Guards _in_batch/_sending_batch and the fields the app threads share with the send thread.
         # Plain (non-reentrant) Lock: no path re-acquires it while held — the one writer that runs
-        # under it, report_onboarding_milestone, calls the lock-free _add_event_str_locked.
+        # under it, report_onboarding_milestone, calls the lock-free _write_locked.
         self._swap_lock = threading.Lock()
         # Serializes collect-and-persist so the send thread and a synchronous crash-path flush cannot
         # interleave. Only ever held across *local disk* work — never across network I/O.
@@ -228,6 +225,7 @@ class KEventDispatcher:
         # first-call directory walk.
         self._collect_and_persist(reduce_storage=False)
         self._flush_deferred_writes()
+        self._network.close()  # release the kept-alive connection; this thread was its only user
 
     def _next_wait_millis(self, uploads_progressing: bool) -> int:
         with self._swap_lock:
@@ -381,8 +379,7 @@ class KEventDispatcher:
         reduced.batch_end_time = sending.batch_end_time
         reduced.custom_events_version = sending.custom_events_version
         reduced.batch_num = num
-        self._write_event_id(reduced.data, reduced.batch_start_time, KEvents.BATCH_DROPPED)
-        reduced.data.write_uint32(KBatchDropReason.TOO_MANY_UNSENT_EVENTS)
+        encoding.batch_dropped(reduced.data, reduced.batch_start_time, KBatchDropReason.TOO_MANY_UNSENT_EVENTS)
 
         written = serializer.save_to_file(reduced, self._batch_filename(reduced))
         with self._queue_lock:
@@ -523,8 +520,7 @@ class KEventDispatcher:
             return -1
 
         marker.data.set_length(0)
-        self._write_event_id(marker.data, marker.batch_start_time, KEvents.BATCH_DROPPED)
-        marker.data.write_uint32(reason)
+        encoding.batch_dropped(marker.data, marker.batch_start_time, reason)
 
         new_size = serializer.save_to_file(marker, filename)
         info.size = new_size
@@ -554,8 +550,7 @@ class KEventDispatcher:
 
     @staticmethod
     def _write_event_id(buf: KBuffer, timestamp: int, event_id: int) -> None:
-        buf.write_uint32(timestamp)
-        buf.write_uint16(event_id)
+        encoding.header(buf, timestamp, event_id)
 
     def _send_if_needed(self) -> None:
         size = self._in_batch.data.length
@@ -573,81 +568,43 @@ class KEventDispatcher:
 
     @staticmethod
     def _capped(s: str) -> str:
-        """Last-mile wire-safety cap on string payloads. One event larger than the cutting threshold
-        cannot be split (cut points fall only between events). Python strings index by code point,
-        so slicing never splits a surrogate the way a UTF-16 substring would."""
-        if len(s) <= MAX_EVENT_STRING_CHARS:
-            return s
-        _log.warning("Event string of %d chars truncated to %d.", len(s), MAX_EVENT_STRING_CHARS)
-        return s[:MAX_EVENT_STRING_CHARS]
+        return encoding.capped(s)
 
-    def add_event(self, event_type: int) -> None:
+    def _write(self, encoder, *args) -> None:
+        """Appends one event, encoded by ``encoder(buf, ts, *args)`` (see :mod:`.encoding`)."""
         with self._swap_lock:
-            self._refresh_now()
-            self._mark_batch_start_if_needed()
-            self._write_event_id(self._in_batch.data, self._frame_timestamp, event_type)
-            self._send_if_needed()
+            self._write_locked(encoder, *args)
 
-    def add_event_str(self, event_type: int, s: str) -> None:
-        with self._swap_lock:
-            self._add_event_str_locked(event_type, s)
-
-    def _add_event_str_locked(self, event_type: int, s: str) -> None:
-        """Body of :meth:`add_event_str`; call only while holding ``_swap_lock``."""
+    def _write_locked(self, encoder, *args) -> None:
+        """Body of :meth:`_write`; call only while holding ``_swap_lock``."""
         self._refresh_now()
         self._mark_batch_start_if_needed()
-        self._write_event_id(self._in_batch.data, self._frame_timestamp, event_type)
-        self._in_batch.data.write_string(self._capped(s))
+        encoder(self._in_batch.data, self._frame_timestamp, *args)
         self._send_if_needed()
 
+    def add_event(self, event_type: int) -> None:
+        self._write(encoding.event, event_type)
+
+    def add_event_str(self, event_type: int, s: str) -> None:
+        self._write(encoding.event_str, event_type, s)
+
     def add_event_uint(self, event_type: int, value: int) -> None:
-        with self._swap_lock:
-            self._refresh_now()
-            self._mark_batch_start_if_needed()
-            self._write_event_id(self._in_batch.data, self._frame_timestamp, event_type)
-            self._in_batch.data.write_uint32(value)
-            self._send_if_needed()
+        self._write(encoding.event_uint, event_type, value)
 
     def add_event_int(self, event_type: int, value: int) -> None:
-        with self._swap_lock:
-            self._refresh_now()
-            self._mark_batch_start_if_needed()
-            self._write_event_id(self._in_batch.data, self._frame_timestamp, event_type)
-            self._in_batch.data.write_int32(value)
-            self._send_if_needed()
+        self._write(encoding.event_int, event_type, value)
 
     def add_event_float(self, event_type: int, value: float) -> None:
-        with self._swap_lock:
-            self._refresh_now()
-            self._mark_batch_start_if_needed()
-            self._write_event_id(self._in_batch.data, self._frame_timestamp, event_type)
-            self._in_batch.data.write_float(value)
-            self._send_if_needed()
+        self._write(encoding.event_float, event_type, value)
 
     def add_event_ushort_pair(self, event_type: int, x: int, y: int) -> None:
-        with self._swap_lock:
-            self._refresh_now()
-            self._mark_batch_start_if_needed()
-            self._write_event_id(self._in_batch.data, self._frame_timestamp, event_type)
-            self._in_batch.data.write_uint16(x)
-            self._in_batch.data.write_uint16(y)
-            self._send_if_needed()
+        self._write(encoding.event_ushort_pair, event_type, x, y)
 
     def add_event_bool(self, event_type: int, flag: bool) -> None:
-        with self._swap_lock:
-            self._refresh_now()
-            self._mark_batch_start_if_needed()
-            self._write_event_id(self._in_batch.data, self._frame_timestamp, event_type)
-            self._in_batch.data.write_raw_byte(2 if flag else 1)  # bool wire encoding: 2=true, 1=false
-            self._send_if_needed()
+        self._write(encoding.event_bool, event_type, flag)
 
     def _add_event_timestamp_seconds(self, event_type: int, seconds: int) -> None:
-        with self._swap_lock:
-            self._refresh_now()
-            self._mark_batch_start_if_needed()
-            self._write_event_id(self._in_batch.data, self._frame_timestamp, event_type)
-            self._in_batch.data.write_uint32(seconds)
-            self._send_if_needed()
+        self._write(encoding.event_uint, event_type, seconds)
 
     # --- Public report API (invoked by the SDK facade) ------------------------------------------
 
@@ -657,162 +614,49 @@ class KEventDispatcher:
             self._mark_batch_start_if_needed()
             self._user_id = uid
             self._in_batch.user_id = uid
-            self._write_event_id(self._in_batch.data, self._frame_timestamp, KEvents.USER_ID_ASSIGNED)
+            encoding.header(self._in_batch.data, self._frame_timestamp, KEvents.USER_ID_ASSIGNED)
             self._send_if_needed()
 
     def assign_to_ab_test_group(self, test_name: str, group: str) -> None:
-        with self._swap_lock:
-            self._refresh_now()
-            self._mark_batch_start_if_needed()
-            self._write_event_id(self._in_batch.data, self._frame_timestamp, KEvents.AB_TEST_ASSIGNMENT)
-            self._in_batch.data.write_string(self._capped(test_name))
-            # A single character written as one byte (its code point), which the backend reads as the
-            # group id. The caller guarantees len == 1 and code point <= 255.
-            self._in_batch.data.write_raw_byte(ord(group))
-            self._send_if_needed()
+        self._write(encoding.ab_test_assignment, test_name, group)
 
     def report_in_app_purchase_usd(self, product_name: str, price_usd_cents: int) -> None:
-        with self._swap_lock:
-            self._refresh_now()
-            self._mark_batch_start_if_needed()
-            ts = self._frame_timestamp
-            self._write_event_id(self._in_batch.data, ts, KEvents.PURCHASE_TIMESTAMP)
-            self._in_batch.data.write_uint32(ts)
-            self._write_event_id(self._in_batch.data, ts, KEvents.PURCHASE_PRODUCT_ID)
-            self._in_batch.data.write_string(self._capped(product_name))
-            self._write_event_id(self._in_batch.data, ts, KEvents.PURCHASE_PRODUCT_PRICE_USD_CENTS)
-            self._in_batch.data.write_uint32(price_usd_cents)
-            self._send_if_needed()
+        self._write(encoding.purchase_usd, product_name, price_usd_cents)
 
     def report_in_app_purchase_local(self, product_name: str, localized_price: float, currency_code: str) -> None:
-        with self._swap_lock:
-            self._refresh_now()
-            self._mark_batch_start_if_needed()
-            ts = self._frame_timestamp
-            self._write_event_id(self._in_batch.data, ts, KEvents.PURCHASE_TIMESTAMP)
-            self._in_batch.data.write_uint32(ts)
-            self._write_event_id(self._in_batch.data, ts, KEvents.PURCHASE_PRODUCT_ID)
-            self._in_batch.data.write_string(self._capped(product_name))
-            self._write_event_id(self._in_batch.data, ts, KEvents.PURCHASE_LOCAL_CURRENCY_NAME)
-            self._in_batch.data.write_string(self._capped(currency_code))
-            self._write_event_id(self._in_batch.data, ts, KEvents.PURCHASE_LOCAL_CURRENCY_AMOUNT)
-            self._in_batch.data.write_float(localized_price)
-            self._send_if_needed()
+        self._write(encoding.purchase_local, product_name, localized_price, currency_code)
 
     def report_ad_offered(self, placement: str, ad_type: int) -> None:
-        with self._swap_lock:
-            self._refresh_now()
-            self._mark_batch_start_if_needed()
-            ts = self._frame_timestamp
-            self._write_event_id(self._in_batch.data, ts, KEvents.AD_OFFERED_PLACEMENT)
-            self._in_batch.data.write_string(self._capped(placement))
-            self._write_event_id(self._in_batch.data, ts, KEvents.AD_OFFERED_TYPE)
-            self._in_batch.data.write_raw_byte(ad_type)
-            self._send_if_needed()
+        self._write(encoding.ad_offered, placement, ad_type)
 
     def report_ad_revenue_usd(self, placement: str, revenue_usd_cents: int) -> None:
-        with self._swap_lock:
-            self._refresh_now()
-            self._mark_batch_start_if_needed()
-            ts = self._frame_timestamp
-            self._write_event_id(self._in_batch.data, ts, KEvents.AD_REVENUE_TIMESTAMP)
-            self._in_batch.data.write_uint32(ts)
-            self._write_event_id(self._in_batch.data, ts, KEvents.AD_REVENUE_PLACEMENT)
-            self._in_batch.data.write_string(self._capped(placement))
-            self._write_event_id(self._in_batch.data, ts, KEvents.AD_REVENUE_USD_CENTS)
-            self._in_batch.data.write_uint32(revenue_usd_cents)
-            self._send_if_needed()
+        self._write(encoding.ad_revenue_usd, placement, revenue_usd_cents)
 
     def report_ad_revenue_local(self, placement: str, localized_revenue: float, currency_code: str) -> None:
-        with self._swap_lock:
-            self._refresh_now()
-            self._mark_batch_start_if_needed()
-            ts = self._frame_timestamp
-            self._write_event_id(self._in_batch.data, ts, KEvents.AD_REVENUE_TIMESTAMP)
-            self._in_batch.data.write_uint32(ts)
-            self._write_event_id(self._in_batch.data, ts, KEvents.AD_REVENUE_PLACEMENT)
-            self._in_batch.data.write_string(self._capped(placement))
-            self._write_event_id(self._in_batch.data, ts, KEvents.AD_REVENUE_LOCAL_CURRENCY_NAME)
-            self._in_batch.data.write_string(self._capped(currency_code))
-            self._write_event_id(self._in_batch.data, ts, KEvents.AD_REVENUE_LOCAL_CURRENCY_AMOUNT)
-            self._in_batch.data.write_float(localized_revenue)
-            self._send_if_needed()
+        self._write(encoding.ad_revenue_local, placement, localized_revenue, currency_code)
 
     def report_subscription_revenue_usd(self, package_name: str, revenue_usd_cents: int) -> None:
-        with self._swap_lock:
-            self._refresh_now()
-            self._mark_batch_start_if_needed()
-            ts = self._frame_timestamp
-            self._write_event_id(self._in_batch.data, ts, KEvents.SUBSCRIPTION_REVENUE_TIMESTAMP)
-            self._in_batch.data.write_uint32(ts)
-            self._write_event_id(self._in_batch.data, ts, KEvents.SUBSCRIPTION_REVENUE_PACKAGE)
-            self._in_batch.data.write_string(self._capped(package_name))
-            self._write_event_id(self._in_batch.data, ts, KEvents.SUBSCRIPTION_REVENUE_USD_CENTS)
-            self._in_batch.data.write_uint32(revenue_usd_cents)
-            self._send_if_needed()
+        self._write(encoding.subscription_revenue_usd, package_name, revenue_usd_cents)
 
     def report_subscription_revenue_local(
         self, package_name: str, localized_revenue: float, currency_code: str
     ) -> None:
-        with self._swap_lock:
-            self._refresh_now()
-            self._mark_batch_start_if_needed()
-            ts = self._frame_timestamp
-            self._write_event_id(self._in_batch.data, ts, KEvents.SUBSCRIPTION_REVENUE_TIMESTAMP)
-            self._in_batch.data.write_uint32(ts)
-            self._write_event_id(self._in_batch.data, ts, KEvents.SUBSCRIPTION_REVENUE_PACKAGE)
-            self._in_batch.data.write_string(self._capped(package_name))
-            self._write_event_id(self._in_batch.data, ts, KEvents.SUBSCRIPTION_LOCAL_CURRENCY_NAME)
-            self._in_batch.data.write_string(self._capped(currency_code))
-            self._write_event_id(self._in_batch.data, ts, KEvents.SUBSCRIPTION_LOCAL_CURRENCY_AMOUNT)
-            self._in_batch.data.write_float(localized_revenue)
-            self._send_if_needed()
+        self._write(encoding.subscription_revenue_local, package_name, localized_revenue, currency_code)
 
     def report_item_exchange(self, exchange_point: str, from_items: Sequence[Item], to_items: Sequence[Item]) -> None:
-        with self._swap_lock:
-            self._refresh_now()
-            self._mark_batch_start_if_needed()
-            self._write_event_id(self._in_batch.data, self._frame_timestamp, KEvents.ITEMS_EXCHANGE)
-            self._in_batch.data.write_string(self._capped(exchange_point))
-            self._write_items(self._in_batch.data, from_items)
-            self._write_items(self._in_batch.data, to_items)
-            self._send_if_needed()
+        self._write(encoding.items_exchange, exchange_point, from_items, to_items)
 
     def report_items_reset(self, location: str, items: Sequence[Item]) -> None:
-        with self._swap_lock:
-            self._refresh_now()
-            self._mark_batch_start_if_needed()
-            self._write_event_id(self._in_batch.data, self._frame_timestamp, KEvents.ITEMS_RESET)
-            self._in_batch.data.write_string(self._capped(location))
-            self._write_items(self._in_batch.data, items)
-            self._send_if_needed()
+        self._write(encoding.event_str_items, KEvents.ITEMS_RESET, location, items)
 
     def report_in_app_purchase_items_granted(self, product_id: str, items: Sequence[Item]) -> None:
-        with self._swap_lock:
-            self._refresh_now()
-            self._mark_batch_start_if_needed()
-            self._write_event_id(self._in_batch.data, self._frame_timestamp, KEvents.ITEMS_PURCHASED_GRANT)
-            self._in_batch.data.write_string(self._capped(product_id))
-            self._write_items(self._in_batch.data, items)
-            self._send_if_needed()
+        self._write(encoding.event_str_items, KEvents.ITEMS_PURCHASED_GRANT, product_id, items)
 
     def report_ad_items_granted(self, placement: str, items: Sequence[Item]) -> None:
-        with self._swap_lock:
-            self._refresh_now()
-            self._mark_batch_start_if_needed()
-            self._write_event_id(self._in_batch.data, self._frame_timestamp, KEvents.ITEMS_AD_GRANTED)
-            self._in_batch.data.write_string(self._capped(placement))
-            self._write_items(self._in_batch.data, items)
-            self._send_if_needed()
+        self._write(encoding.event_str_items, KEvents.ITEMS_AD_GRANTED, placement, items)
 
     def report_subscription_items_granted(self, package_name: str, items: Sequence[Item]) -> None:
-        with self._swap_lock:
-            self._refresh_now()
-            self._mark_batch_start_if_needed()
-            self._write_event_id(self._in_batch.data, self._frame_timestamp, KEvents.ITEMS_SUBSCRIPTION_GRANTED)
-            self._in_batch.data.write_string(self._capped(package_name))
-            self._write_items(self._in_batch.data, items)
-            self._send_if_needed()
+        self._write(encoding.event_str_items, KEvents.ITEMS_SUBSCRIPTION_GRANTED, package_name, items)
 
     def report_pre_sdk_registration_date(self, seconds: int) -> None:
         self._add_event_timestamp_seconds(KEvents.PRE_SDK_REGISTRATION_DATE, seconds)
@@ -877,7 +721,7 @@ class KEventDispatcher:
 
             name = f"{milestone} (#{occurrences})" if occurrences > 1 else milestone
             # Lock-free variant: we already hold _swap_lock (which is non-reentrant).
-            self._add_event_str_locked(KEvents.ONBOARDING_MILESTONE, name)
+            self._write_locked(encoding.event_str, KEvents.ONBOARDING_MILESTONE, name)
 
     def set_test_user_name(self, tester_name: str) -> None:
         """Marks this device as a test user. The disk write is deferred to the send thread."""
@@ -904,15 +748,7 @@ class KEventDispatcher:
 
     @staticmethod
     def _write_items(buf: KBuffer, items: Sequence[Item]) -> None:
-        """Writes an item list, capped at ``MAX_ITEMS_PER_EVENT`` so no single event exceeds the
-        cutting threshold (which the slicing logic cannot split)."""
-        count = min(len(items), MAX_ITEMS_PER_EVENT)
-        if count < len(items):
-            _log.error("Item list truncated from %d to %d entries.", len(items), count)
-        buf.write_int32(count)
-        for i in range(count):
-            buf.write_string(items[i].name)
-            buf.write_uint32(items[i].count)
+        encoding.write_items(buf, items)
 
     # --- Helpers --------------------------------------------------------------------------------
 

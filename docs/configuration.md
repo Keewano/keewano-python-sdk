@@ -109,6 +109,10 @@ Use an **HTTPS** endpoint: the API key travels as a request header, so a plainte
 a credential on the wire. `proxy_auth_bearer` exists for the common test setup where that staging
 ingress sits behind an authenticating proxy.
 
+The SDK connects to the endpoint directly and reuses one kept-alive connection for its uploads.
+HTTP(S) proxy environment variables (`HTTPS_PROXY`, `NO_PROXY`, …) are **not** used, and redirects
+are not followed.
+
 ## Test mode
 
 To keep your own testing out of production analytics, tag this install as a test user:

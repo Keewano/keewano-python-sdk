@@ -14,6 +14,7 @@ from __future__ import annotations
 import atexit
 import logging
 import os
+import re
 import struct
 import sys
 import threading
@@ -324,6 +325,39 @@ MIN_INT32 = -0x80000000
 MAX_INT32 = 0x7FFFFFFF
 
 
+#: Characters an HTTP header value cannot carry (RFC 9110 allows HTAB, SP, visible ASCII and bytes
+#: 0x80-0xFF): the other C0 controls, including CR and LF, and DEL.
+_HEADER_CONTROL_CHARS = re.compile("[\x00-\x08\x0a-\x1f\x7f]")
+
+
+def _validate_test_user(test_user_name: Optional[str], caller: str) -> Optional[str]:
+    """Validates that the test user name can travel as the K-Tester header, returning it, or None
+    (logged) if it cannot. Either failure would otherwise break every upload, not just the header:
+    the transport treats the error as an unreachable ingress, so batches would be retried forever.
+
+    * It must be encodable as latin-1, since http.client encodes str header values as latin-1. So
+      test_user_name="тест" raises UnicodeEncodeError.
+    * It must not contain control characters other than a tab. http.client rejects a value with a
+      line break (which would otherwise inject a header), and proxies may reject the other controls.
+
+    It is assumed that this is called after test_user_name has gone through _name validation."""
+    if test_user_name is None:
+        return None
+    try:
+        test_user_name.encode("latin-1")
+    except UnicodeEncodeError:
+        _log.error("%s: test_user_name is not encodable as latin-1; ignoring it.", caller)
+        return None
+    if _HEADER_CONTROL_CHARS.search(test_user_name):
+        _log.error(
+            "%s: test_user_name contains a control character (e.g. a line break), which an HTTP header "
+            "cannot carry; ignoring it.",
+            caller,
+        )
+        return None
+    return test_user_name
+
+
 def _name(value: Optional[str], param: str, caller: str, max_len: int = MAX_STRING_LENGTH) -> Optional[str]:
     """Validates a dimension value. Blank → dropped (None); over-long → truncated to ``max_len``
     (defaults to :data:`MAX_STRING_LENGTH`); not UTF-8 encodable → dropped (None). Returns the value to
@@ -448,6 +482,57 @@ def _items(items: Optional[Sequence[Item]], param: str, caller: str) -> Optional
         if not _count(item.count, f"{param}[{item.name}].count", caller):
             return None
     return list(items)
+
+
+def _revenue(
+    name: Optional[str],
+    name_param: str,
+    usd_cents: Optional[int],
+    usd_param: str,
+    localized: Optional[float],
+    localized_param: str,
+    currency_code: Optional[str],
+    caller: str,
+):
+    """Validates the "name + (US cents | localized amount + currency)" shape shared by purchases, ad
+    revenue and subscription revenue. Returns ``(name, cents)`` or ``(name, amount, currency)`` —
+    the payload for the USD or local-currency encoder respectively — or None to drop the event."""
+    checked = _name(name, name_param, caller)
+    if checked is None:
+        return None
+    if usd_cents is not None:
+        if not _count(usd_cents, usd_param, caller):
+            return None
+        return (checked, usd_cents)
+    if localized is not None and currency_code is not None:
+        currency = _name(currency_code, "currency_code", caller)
+        if currency is None or not _amount(localized, localized_param, caller):
+            return None
+        return (checked, localized, currency)
+    _log.error("%s: provide %s or (%s and currency_code).", caller, usd_param, localized_param)
+    return None
+
+
+def _ab_group(group: str, caller: str) -> bool:
+    """True if ``group`` is a single character whose code point fits the one wire byte."""
+    # Type-check before len()/ord(): a non-str raises in both.
+    if not isinstance(group, str):
+        _log.error("%s: 'group' must be a string, got %s; event dropped.", caller, type(group).__name__)
+        return False
+    if len(group) != 1:
+        _log.error("%s: 'group' must be a single character; event dropped.", caller)
+        return False
+    if ord(group) > MAX_UINT8:
+        # e.g. a non-Latin-1 char or a lone surrogate: it can't be represented as one wire byte.
+        _log.error(
+            "%s: 'group' %r has code point %d, above the %d single-byte limit; event dropped.",
+            caller,
+            group,
+            ord(group),
+            MAX_UINT8,
+        )
+        return False
+    return True
 
 
 # --------------------------------------------------------------------------------------------
@@ -626,20 +711,22 @@ def report_in_app_purchase(
     ``price_usd_cents`` (US cents) or both ``localized_price`` and ``currency_code`` (ISO 4217)."""
 
     def _do(d: KEventDispatcher) -> None:
-        product = _name(product_name, "product_name", "report_in_app_purchase")
-        if product is None:
+        args = _revenue(
+            product_name,
+            "product_name",
+            price_usd_cents,
+            "price_usd_cents",
+            localized_price,
+            "localized_price",
+            currency_code,
+            "report_in_app_purchase",
+        )
+        if args is None:
             return
-        if price_usd_cents is not None:
-            if not _count(price_usd_cents, "price_usd_cents", "report_in_app_purchase"):
-                return
-            d.report_in_app_purchase_usd(product, price_usd_cents)
-        elif localized_price is not None and currency_code is not None:
-            currency = _name(currency_code, "currency_code", "report_in_app_purchase")
-            if currency is None or not _amount(localized_price, "localized_price", "report_in_app_purchase"):
-                return
-            d.report_in_app_purchase_local(product, localized_price, currency)
+        if len(args) == 2:
+            d.report_in_app_purchase_usd(*args)
         else:
-            _log.error("report_in_app_purchase: provide price_usd_cents or (localized_price and currency_code).")
+            d.report_in_app_purchase_local(*args)
 
     _with_dispatcher(_do)
 
@@ -689,20 +776,22 @@ def report_ad_revenue(
     ``currency_code`` (ISO 4217)."""
 
     def _do(d: KEventDispatcher) -> None:
-        where = _name(placement, "placement", "report_ad_revenue")
-        if where is None:
+        args = _revenue(
+            placement,
+            "placement",
+            revenue_usd_cents,
+            "revenue_usd_cents",
+            localized_revenue,
+            "localized_revenue",
+            currency_code,
+            "report_ad_revenue",
+        )
+        if args is None:
             return
-        if revenue_usd_cents is not None:
-            if not _count(revenue_usd_cents, "revenue_usd_cents", "report_ad_revenue"):
-                return
-            d.report_ad_revenue_usd(where, revenue_usd_cents)
-        elif localized_revenue is not None and currency_code is not None:
-            currency = _name(currency_code, "currency_code", "report_ad_revenue")
-            if currency is None or not _amount(localized_revenue, "localized_revenue", "report_ad_revenue"):
-                return
-            d.report_ad_revenue_local(where, localized_revenue, currency)
+        if len(args) == 2:
+            d.report_ad_revenue_usd(*args)
         else:
-            _log.error("report_ad_revenue: provide revenue_usd_cents or (localized_revenue and currency_code).")
+            d.report_ad_revenue_local(*args)
 
     _with_dispatcher(_do)
 
@@ -735,22 +824,22 @@ def report_subscription_revenue(
     ``revenue_usd_cents`` or both ``localized_revenue`` and ``currency_code`` (ISO 4217)."""
 
     def _do(d: KEventDispatcher) -> None:
-        pkg = _name(package_name, "package_name", "report_subscription_revenue")
-        if pkg is None:
+        args = _revenue(
+            package_name,
+            "package_name",
+            revenue_usd_cents,
+            "revenue_usd_cents",
+            localized_revenue,
+            "localized_revenue",
+            currency_code,
+            "report_subscription_revenue",
+        )
+        if args is None:
             return
-        if revenue_usd_cents is not None:
-            if not _count(revenue_usd_cents, "revenue_usd_cents", "report_subscription_revenue"):
-                return
-            d.report_subscription_revenue_usd(pkg, revenue_usd_cents)
-        elif localized_revenue is not None and currency_code is not None:
-            currency = _name(currency_code, "currency_code", "report_subscription_revenue")
-            if currency is None or not _amount(localized_revenue, "localized_revenue", "report_subscription_revenue"):
-                return
-            d.report_subscription_revenue_local(pkg, localized_revenue, currency)
+        if len(args) == 2:
+            d.report_subscription_revenue_usd(*args)
         else:
-            _log.error(
-                "report_subscription_revenue: provide revenue_usd_cents or (localized_revenue and currency_code)."
-            )
+            d.report_subscription_revenue_local(*args)
 
     _with_dispatcher(_do)
 
@@ -851,25 +940,7 @@ def report_ab_test_group_assignment(test_name: str, group: str) -> None:
         test = _name(test_name, "test_name", "report_ab_test_group_assignment")
         if test is None:
             return
-        # Type-check before len()/ord(): a non-str raises in both.
-        if not isinstance(group, str):
-            _log.error(
-                "report_ab_test_group_assignment: 'group' must be a string, got %s; event dropped.",
-                type(group).__name__,
-            )
-            return
-        if len(group) != 1:
-            _log.error("report_ab_test_group_assignment: 'group' must be a single character; event dropped.")
-            return
-        if ord(group) > MAX_UINT8:
-            # e.g. a non-Latin-1 char or a lone surrogate: it can't be represented as one wire byte.
-            _log.error(
-                "report_ab_test_group_assignment: 'group' %r has code point %d, above the %d single-byte "
-                "limit; event dropped.",
-                group,
-                ord(group),
-                MAX_UINT8,
-            )
+        if not _ab_group(group, "report_ab_test_group_assignment"):
             return
         d.assign_to_ab_test_group(test, group)
 
@@ -899,7 +970,7 @@ def mark_as_test_user(tester_name: str) -> None:
     """Marks this device as a test user so Keewano AI excludes it from production analytics."""
 
     def _do(d: KEventDispatcher) -> None:
-        checked = _name(tester_name, "tester_name", "mark_as_test_user")
+        checked = _validate_test_user(_name(tester_name, "tester_name", "mark_as_test_user"), "mark_as_test_user")
         if checked is not None:
             d.set_test_user_name(checked)
 

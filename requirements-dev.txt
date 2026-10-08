@@ -29,3 +29,8 @@ flake8==7.3.0
 # and CI just adds the coverage reporting around the same tests.
 pytest==9.1.1
 pytest-cov==7.1.0
+
+# The HTTPS tests (tests/test_network.py) serve TLS from a throwaway CA minted in memory, so no
+# certificate or private key is ever committed (gitleaks would reject a key file). They skip
+# when it is missing, so the plain `python -m unittest` run still works without dev requirements.
+trustme==1.2.1

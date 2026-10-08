@@ -443,6 +443,50 @@ class ValidationTest(FacadeTestBase):
                 keewano_sdk.log_error(bad)
 
 
+class TestUserNameTest(FacadeTestBase):
+    """mark_as_test_user only accepts names that can travel as the Latin-1 K-Tester header."""
+
+    def test_latin1_name_reaches_the_dispatcher_and_a_non_latin1_one_does_not(self):
+        self._init()
+        got = []
+        sdkmod._dispatcher.set_test_user_name = got.append
+        keewano_sdk.mark_as_test_user("qa-café")
+        with self.assertLogs("keewano_sdk", level="ERROR"):
+            keewano_sdk.mark_as_test_user("тест")
+        self.assertEqual(got, ["qa-café"])
+
+    def test_latin1_name_is_sent_as_the_k_tester_header(self):
+        with MockIngress() as srv:
+            self._init(srv)
+            keewano_sdk.mark_as_test_user("qa-café")
+            keewano_sdk.report_button_click("Play")
+            keewano_sdk.flush()
+            self.assertTrue(wait_until(lambda: any("k-tester" in h for h, _ in srv.batch_posts)))
+            self.assertEqual(next(h for h, _ in srv.batch_posts if "k-tester" in h)["k-tester"], "qa-café")
+
+    def test_rejected_name_does_not_stall_uploads(self):
+        with MockIngress() as srv:
+            self._init(srv)
+            with self.assertLogs("keewano_sdk", level="ERROR"):
+                keewano_sdk.mark_as_test_user("тест")
+            keewano_sdk.report_button_click("Play")
+            keewano_sdk.flush()
+            self.assertTrue(wait_until(lambda: len(srv.batch_posts) >= 1))
+            self.assertTrue(all("k-tester" not in h for h, _ in srv.batch_posts))
+
+
+class TestUserNameControlCharsTest(FacadeTestBase):
+    def test_name_with_a_line_break_is_rejected_and_uploads_still_work(self):
+        with MockIngress() as srv:
+            self._init(srv)
+            with self.assertLogs("keewano_sdk", level="ERROR"):
+                keewano_sdk.mark_as_test_user("qa\nbob")
+            keewano_sdk.report_button_click("Play")
+            keewano_sdk.flush()
+            self.assertTrue(wait_until(lambda: len(srv.batch_posts) >= 1))
+            self.assertTrue(all("k-tester" not in h for h, _ in srv.batch_posts))
+
+
 class FacadeSurfaceTest(FacadeTestBase):
     def test_namespace_attributes_are_the_module_functions(self):
         self.assertIs(KeewanoSDK.report_button_click, keewano_sdk.report_button_click)
@@ -656,6 +700,34 @@ class ValidationHelpersTest(unittest.TestCase):
             sdkmod._name("y" * sdkmod.MAX_STRING_LENGTH + "\ud800", "p", "c"),
             "y" * sdkmod.MAX_STRING_LENGTH,
         )
+
+    def test_validate_test_user_passes_none_and_latin1_names(self):
+        self.assertIsNone(sdkmod._validate_test_user(None, "c"))  # "no test user" stays that way
+        for name in ("qa-alice", "café", "Ünïcödé", chr(0xFF)):  # Latin-1 covers U+0000..U+00FF
+            with self.subTest(name=name):
+                self.assertEqual(sdkmod._validate_test_user(name, "c"), name)
+
+    def test_validate_test_user_rejects_names_outside_latin1(self):
+        # It travels as the K-Tester header, which http.client encodes as Latin-1: one of these would
+        # make every upload fail with UnicodeEncodeError.
+        for name in ("тест", "qa€", "测试", "\U0001f600"):
+            with self.subTest(name=name):
+                with self.assertLogs("keewano_sdk", level="ERROR") as cm:
+                    self.assertIsNone(sdkmod._validate_test_user(name, "my_caller"))
+                self.assertTrue(any("my_caller" in m and "latin-1" in m for m in cm.output))
+
+    def test_validate_test_user_rejects_control_characters(self):
+        # http.client refuses a header value with a line break (it would inject a header), and the
+        # transport would report that as an unreachable ingress, stalling every upload.
+        for name in ("qa\nbob", "qa\rbob", "qa\r\nX-Evil: 1", "qa\x00", "qa\x7f", "\x1b[31mqa"):
+            with self.subTest(name=name):
+                with self.assertLogs("keewano_sdk", level="ERROR") as cm:
+                    self.assertIsNone(sdkmod._validate_test_user(name, "my_caller"))
+                self.assertTrue(any("my_caller" in m and "control character" in m for m in cm.output))
+
+    def test_validate_test_user_allows_a_tab(self):
+        # RFC 9110 allows HTAB in a header value, and http.client sends it.
+        self.assertEqual(sdkmod._validate_test_user("qa\tbob", "c"), "qa\tbob")
 
     def test_count_rejects_negative_and_over_uint32(self):
         self.assertTrue(sdkmod._count(0, "p", "c"))

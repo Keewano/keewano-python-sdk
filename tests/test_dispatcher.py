@@ -46,6 +46,9 @@ class _FakeTransport:
     def register_custom_events(self, version, event_count, gzip_data):
         return True
 
+    def close(self):
+        pass
+
 
 def _make_dispatcher(
     work_dir,
@@ -579,6 +582,9 @@ class DispatcherReliabilityTest(unittest.TestCase):
                 entered.set()
                 release.wait(5.0)  # park here, as a real upload stuck on the socket read would
                 return SendResult.UNREACHABLE
+
+            def close(self):
+                pass
 
         disp = _make_dispatcher(self._dir)  # dead endpoint: sender idle until we feed it a batch
         disp._network = _BlockingTransport()

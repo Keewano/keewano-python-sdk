@@ -1,5 +1,8 @@
 # API reference
 
+> This page covers the client API (one install, one user). For a backend reporting on behalf of many
+> users, see the [server-side guide](server-side.md) (`keewano_sdk.server_sdk`).
+
 Every public entry point is available in two equivalent ways:
 
 - as a **module-level function** — `keewano_sdk.report_button_click("Play")`, and

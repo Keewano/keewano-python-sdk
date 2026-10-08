@@ -20,6 +20,7 @@ project.
 - [Calling generated reporters](#calling-generated-reporters)
 - [What gets added to your project](#what-gets-added-to-your-project)
 - [Rules & gotchas](#rules--gotchas)
+- [Server-side SDK](#server-side-sdk)
 
 ---
 
@@ -162,3 +163,25 @@ the generated file with your source (or generate it as a build step).
 > Implementing the codegen tool itself? The contract it implements — the encoding, the id numbering
 > and the hash that identifies an event set — is
 > [The frozen contract](https://github.com/Keewano/keewano-codegen#the-frozen-contract) in the codegen's own README.
+
+## Server-side SDK
+
+The generated module serves the [server-side SDK](server-side.md) too: next to every client reporter
+`report_<name>(...)` it defines `server_report_<name>(user_id, ...)`, which takes the end user's id
+first. Pass `CUSTOM_EVENT_SET` as `KeewanoServerConfig.custom_event_set` and call the `server_`
+reporters:
+
+```python
+from myapp import keewano_custom_events
+from keewano_sdk import server_sdk as keewano, KeewanoServerConfig
+
+keewano.initialize(KeewanoServerConfig(api_key="…", custom_event_set=keewano_custom_events.CUSTOM_EVENT_SET))
+keewano_custom_events.server_report_enemy_killed(user_id, "orc")
+```
+
+`user_id` accepts the same forms as every server call (`int`, GUID `str` or `uuid.UUID`; typed as
+`keewano_sdk.UserId`). The server reporters go through `KeewanoServerCodegen`, which has the same
+payload types and validation as the client bridge. The `server_` names are derived from the client
+names, so an event name the codegen accepts works for both. Use the reporter that matches the SDK you
+initialized: a `server_` reporter before `keewano_sdk.server_sdk.initialize()` is dropped with a
+warning, exactly like a client reporter before `keewano_sdk.initialize()`.

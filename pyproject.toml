@@ -4,7 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "keewano-sdk"
-version = "1.0.0"
+# The version has one source of truth: __version__ in keewano_sdk/__init__.py (also sent on every request
+# as `K-SDK: Python/<version>`). setuptools reads it at build time via [tool.setuptools.dynamic] below.
+dynamic = ["version"]
 description = "Keewano analytics SDK for native Python applications"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -29,6 +31,9 @@ Issues = "https://github.com/Keewano/keewano-python-sdk/issues"
 
 [tool.setuptools.packages.find]
 include = ["keewano_sdk*"]
+
+[tool.setuptools.dynamic]
+version = { attr = "keewano_sdk.__version__" }
 
 [tool.setuptools.package-data]
 keewano_sdk = ["py.typed"]

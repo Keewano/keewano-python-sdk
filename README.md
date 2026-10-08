@@ -40,6 +40,10 @@ New here? Start with **[Getting started](docs/getting-started.md)**.
 - **Resilient**: batches persist to disk (capped at 50 MB), survive restarts, and upload when a
   network is available.
 
+- **Server-side mode** (`keewano_sdk.server_sdk`): report on behalf of many end users from one backend
+  process — per-user aggregation and data sessions, bounded memory, RAM-only or persistent storage,
+  and fork-safe under gunicorn/Celery. See [docs/server-side.md](docs/server-side.md).
+
 ---
 
 ## Installation
@@ -80,6 +84,18 @@ keewano_sdk.report_button_click("Play")
 from keewano_sdk import KeewanoSDK
 KeewanoSDK.report_button_click("Play")
 ```
+
+### Server-side (many users per process)
+
+```python
+from keewano_sdk import server_sdk as keewano, KeewanoServerConfig
+
+keewano.initialize(KeewanoServerConfig(api_key="YOUR_KEEWANO_API_KEY"))
+keewano.report_in_app_purchase(user_id, "gems_100", price_usd_cents=499)  # user id comes first
+```
+
+See the [server-side guide](docs/server-side.md) for batching, storage, memory limits and
+multi-process deployment.
 
 ---
 
@@ -202,19 +218,24 @@ data directory. If this is the case, override the directory setting so that each
 ├── keewano_sdk/
 │   ├── __init__.py               # public API exports
 │   ├── sdk.py                    # public API + init + exception hooks + atexit flush
-│   ├── config.py                 # KeewanoConfig
+│   ├── server_sdk.py             # server-side API: report_*(user_id, ...) for many users
+│   ├── config.py                 # KeewanoConfig, KeewanoServerConfig
 │   ├── item.py, ad_type.py       # public value types
 │   └── internal/                 # engine (not part of the public API)
 │       ├── dispatcher.py         # double-buffered batching + upload thread
+│       ├── server_dispatcher.py  # server engine: per-user batches, LRU, ordered upload
+│       ├── work_dir_lease.py     # per-process leased work dirs under a shared data_dir
+│       ├── encoding.py           # event encoders shared by both engines
 │       ├── batch.py / serializer.py     # .kwub batch format
 │       ├── buffer.py / guid.py          # byte-exact wire encoding
-│       ├── network.py            # HTTP transport (K-* headers, urllib)
+│       ├── network.py            # HTTP transport (K-* headers, kept-alive http.client)
 │       ├── storage.py            # durable identifiers / consent
 │       ├── environment.py        # host/device introspection for the launch burst
 │       ├── paths.py              # default per-user data directory
 │       ├── events.py             # permanent predefined event IDs
 │       └── consent.py            # consent state enum
 ├── sample/main.py                # runnable example
+├── sample/server_main.py         # runnable server-side example
 ├── tests/test_binary_format.py   # wire-format regression tests
 └── docs/                         # user-facing guides (getting started, API reference, …)
 ```

@@ -3,11 +3,12 @@
 import os
 import sys
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from mockserver import MockIngress  # noqa: E402
+from mockserver import TLS_AVAILABLE, MockIngress, trusting_context  # noqa: E402
 
-from keewano_sdk.internal import guid  # noqa: E402
+from keewano_sdk.internal import guid, network  # noqa: E402
 from keewano_sdk.internal.batch import KBatch  # noqa: E402
 from keewano_sdk.internal.network import KNetwork, SendResult  # noqa: E402
 
@@ -111,6 +112,113 @@ class KNetworkTest(unittest.TestCase):
             srv.set_custom_post_status(400)
             net = KNetwork(srv.endpoint, "s", None, "1.0.0")
             self.assertFalse(net.register_custom_events(1, 1, b"x"))
+
+
+class ConnectionReuseTest(unittest.TestCase):
+    def test_one_connection_serves_many_requests(self):
+        with MockIngress(keep_alive=True) as srv:
+            net = KNetwork(srv.endpoint, "s", None, "1.0.0")
+            for _ in range(5):
+                self.assertEqual(net.send_batch(_batch_with_payload(), test_user=None), SendResult.ACCEPTED)
+            self.assertTrue(net.get_custom_event_ids(1).has_mapping)
+            self.assertTrue(net.register_custom_events(1, 1, b"x"))
+            self.assertEqual(len(srv.batch_posts), 5)
+            self.assertEqual(srv.connections, 1)
+            net.close()
+
+    def test_connection_closed_by_server_is_replaced_without_duplicates(self):
+        with MockIngress(keep_alive=True, drop_after_reply=True) as srv:
+            net = KNetwork(srv.endpoint, "s", None, "1.0.0")
+            for _ in range(3):
+                self.assertEqual(net.send_batch(_batch_with_payload(), test_user=None), SendResult.ACCEPTED)
+            self.assertEqual(len(srv.batch_posts), 3)  # each batch arrived exactly once
+            self.assertEqual(srv.connections, 3)
+
+    def test_server_that_does_not_keep_alive(self):
+        with MockIngress(keep_alive=False) as srv:
+            net = KNetwork(srv.endpoint, "s", None, "1.0.0")
+            for _ in range(3):
+                self.assertEqual(net.send_batch(_batch_with_payload(), test_user=None), SendResult.ACCEPTED)
+            self.assertEqual(srv.connections, 3)
+
+    def test_idle_connection_is_replaced_before_use(self):
+        with MockIngress(keep_alive=True) as srv, mock.patch.object(network, "_IDLE_CLOSE_S", -1.0):
+            net = KNetwork(srv.endpoint, "s", None, "1.0.0")
+            net.send_batch(_batch_with_payload(), test_user=None)
+            net.send_batch(_batch_with_payload(), test_user=None)
+            self.assertEqual(srv.connections, 2)
+
+    def test_close_then_send_reconnects(self):
+        with MockIngress(keep_alive=True) as srv:
+            net = KNetwork(srv.endpoint, "s", None, "1.0.0")
+            net.send_batch(_batch_with_payload(), test_user=None)
+            net.close()
+            self.assertEqual(net.send_batch(_batch_with_payload(), test_user=None), SendResult.ACCEPTED)
+            self.assertEqual(srv.connections, 2)
+
+    def test_unusable_endpoints_are_unreachable_not_errors(self):
+        for endpoint in ("ftp://example.com/base", "not a url", "http://127.0.0.1:notaport/base"):
+            with self.subTest(endpoint=endpoint):
+                with self.assertLogs("keewano_sdk", level="ERROR"):
+                    net = KNetwork(endpoint, "s", None, "1.0.0")
+                self.assertEqual(net.send_batch(_batch_with_payload(), test_user=None), SendResult.UNREACHABLE)
+
+    @unittest.skipUnless(hasattr(os, "fork"), "needs os.fork")
+    def test_forked_child_drops_the_inherited_connection(self):
+        with MockIngress(keep_alive=True) as srv:
+            net = KNetwork(srv.endpoint, "s", None, "1.0.0")
+            net.send_batch(_batch_with_payload(), test_user=None)
+            pid = os.fork()
+            if pid == 0:
+                code = 1
+                try:
+                    # The at-fork hook already ran: the child must not touch the parent's socket.
+                    if net._conn is None and net.send_batch(_batch_with_payload(), None) == SendResult.ACCEPTED:
+                        code = 0
+                finally:
+                    os._exit(code)
+            _, status = os.waitpid(pid, 0)
+            self.assertEqual(status, 0)
+            # The parent's connection is intact and still reused.
+            self.assertEqual(net.send_batch(_batch_with_payload(), test_user=None), SendResult.ACCEPTED)
+            self.assertEqual(len(srv.batch_posts), 3)
+            self.assertEqual(srv.connections, 2)
+
+
+@unittest.skipUnless(TLS_AVAILABLE, "needs trustme (requirements-dev.txt)")
+class KNetworkTlsTest(unittest.TestCase):
+    """The HTTPS transport: certificate verification, and keep-alive/reconnect over TLS."""
+
+    def _net(self, srv):
+        # Trust only the mock's self-signed certificate; verification itself stays as in production.
+        with mock.patch.object(network.ssl, "create_default_context", trusting_context):
+            net = KNetwork(srv.endpoint, "s", None, "1.0.0")
+            net.send_batch(_batch_with_payload(), test_user=None)  # builds the SSL context under the patch
+        self.addCleanup(net.close)
+        return net
+
+    def test_one_tls_connection_serves_many_requests(self):
+        with MockIngress(keep_alive=True, tls=True) as srv:
+            net = self._net(srv)
+            for _ in range(4):
+                self.assertEqual(net.send_batch(_batch_with_payload(), test_user=None), SendResult.ACCEPTED)
+            self.assertTrue(net.get_custom_event_ids(1).has_mapping)
+            self.assertEqual(len(srv.batch_posts), 5)
+            self.assertEqual(srv.connections, 1)
+
+    def test_tls_connection_closed_by_server_is_replaced_without_duplicates(self):
+        with MockIngress(keep_alive=True, drop_after_reply=True, tls=True) as srv:
+            net = self._net(srv)
+            for _ in range(2):
+                self.assertEqual(net.send_batch(_batch_with_payload(), test_user=None), SendResult.ACCEPTED)
+            self.assertEqual(len(srv.batch_posts), 3)  # each batch arrived exactly once
+            self.assertEqual(srv.connections, 3)
+
+    def test_untrusted_certificate_is_unreachable(self):
+        with MockIngress(keep_alive=True, tls=True) as srv:
+            net = KNetwork(srv.endpoint, "s", None, "1.0.0")  # default trust store: self-signed is refused
+            self.assertEqual(net.send_batch(_batch_with_payload(), test_user=None), SendResult.UNREACHABLE)
+            self.assertEqual(srv.batch_posts, [])
 
 
 if __name__ == "__main__":

@@ -14,15 +14,24 @@ Quick start::
     keewano_sdk.set_user_id(1234567890)
     keewano_sdk.report_in_app_purchase("gems_100", price_usd_cents=499)
     keewano_sdk.report_in_app_purchase_items_granted("gems_100", [Item("gems", 100)])
+
+For a backend that reports on behalf of many end users, use :mod:`keewano_sdk.server_sdk` instead —
+every call there takes the user's id (see ``docs/server-side.md``)::
+
+    from keewano_sdk import server_sdk as keewano, KeewanoServerConfig
+
+    keewano.initialize(KeewanoServerConfig(api_key="YOUR_KEEWANO_API_KEY"))
+    keewano.report_in_app_purchase(user_id, "gems_100", price_usd_cents=499)
 """
 
 from __future__ import annotations
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"
 
 from .ad_type import AdType
-from .codegen import KeewanoCodegen
-from .config import DEFAULT_ENDPOINT, KeewanoConfig
+from . import server_sdk
+from .codegen import KeewanoCodegen, KeewanoServerCodegen
+from .config import DEFAULT_ENDPOINT, KeewanoConfig, KeewanoServerConfig
 from .internal.custom_event_set import CustomEventSet
 from .item import Item
 from .sdk import (
@@ -62,6 +71,7 @@ from .sdk import (
     set_user_id,
     shutdown,
 )
+from .server_sdk import KeewanoServerSDK, UserId
 
 __all__ = [
     "__version__",
@@ -71,6 +81,11 @@ __all__ = [
     "Item",
     "KeewanoConfig",
     "KeewanoSDK",
+    "KeewanoServerCodegen",
+    "KeewanoServerConfig",
+    "KeewanoServerSDK",
+    "server_sdk",
+    "UserId",
     "DEFAULT_ENDPOINT",
     "initialize",
     "shutdown",
